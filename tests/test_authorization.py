@@ -119,7 +119,12 @@ def test_valid_reconciliation_syntax_is_preserved(sessions, suffix, expected):
     update = _message_update(text="/reconcile " + " ".join(args))
     import asyncio
     asyncio.run(reconcile_command(update, _context(sessions, args)))
-    assert _snapshot(sessions, draft_id, attempt_id)[0] == expected
+    snapshot = _snapshot(sessions, draft_id, attempt_id)
+    assert snapshot[0] == expected
+    if suffix[0] == "found":
+        assert snapshot[1:4] == ("succeeded", suffix[1], 1)
+    else:
+        assert snapshot[1] == "unknown"
 
 
 @pytest.mark.parametrize("command_text,args,handler", [
@@ -182,3 +187,45 @@ def test_authorized_user_in_group_is_denied(sessions):
     with sessions() as session:
         assert session.get(AppSetting, "publishing_paused") is None
     context.application.bot.send_message.assert_not_awaited()
+
+
+def test_repeated_approval_callback_does_not_schedule_twice(sessions):
+    with sessions() as session:
+        _, _, draft = sample_rows(session)
+        draft_id = draft.id
+        session.commit()
+
+    import asyncio
+    context = _context(sessions)
+    first_update = _callback_update(f"draft:approve:{draft_id}")
+    asyncio.run(draft_callback(first_update, context))
+    second_update = _callback_update(f"draft:approve:{draft_id}")
+    asyncio.run(draft_callback(second_update, context))
+
+    with sessions() as session:
+        approved = session.get(Draft, draft_id)
+        approvals = session.scalar(select(func.count(AuditEvent.id)).where(
+            AuditEvent.event_type == "draft_approved",
+            AuditEvent.target_id == str(draft_id)))
+        assert approved.draft_state == "approved"
+        assert approved.approved_by == 123
+        assert approvals == 1
+        assert session.scalar(select(func.count(PublicationAttempt.id)).where(
+            PublicationAttempt.draft_id == draft_id)) == 0
+        assert session.scalar(select(func.count(Publication.id)).where(
+            Publication.draft_id == draft_id)) == 0
+
+
+def test_unknown_draft_callback_action_does_not_fall_through_to_rejection(sessions):
+    with sessions() as session:
+        _, _, draft = sample_rows(session)
+        draft_id = draft.id
+        before = (draft.draft_state, draft.rejection_reason)
+        session.commit()
+
+    import asyncio
+    update = _callback_update(f"draft:surprise:{draft_id}")
+    asyncio.run(draft_callback(update, _context(sessions)))
+    with sessions() as session:
+        draft = session.get(Draft, draft_id)
+        assert (draft.draft_state, draft.rejection_reason) == before

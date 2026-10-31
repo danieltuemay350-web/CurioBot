@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
@@ -17,6 +18,10 @@ from app.workflow import audit
 class DefinitePublishError(RuntimeError):
     """Telegram explicitly rejected the send; retry may be safe within limits."""
 
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
 
 class AmbiguousPublishError(RuntimeError):
     """The request may have reached Telegram but no reliable result arrived."""
@@ -24,6 +29,26 @@ class AmbiguousPublishError(RuntimeError):
 
 class PublishBlocked(RuntimeError):
     """Publishing is blocked by a safety or scheduling condition."""
+
+
+def normalize_retry_after(value: object) -> float | None:
+    if isinstance(value, timedelta):
+        value = value.total_seconds()
+    if isinstance(value, bool):
+        return None
+    try:
+        delay = float(value)
+    except (TypeError, ValueError):
+        return None
+    return delay if math.isfinite(delay) and delay >= 0 else None
+
+
+def _valid_message_id(value: object) -> bool:
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return False
+    raw = str(value)
+    return (raw.isascii() and raw.isdecimal() and len(raw) <= 20
+            and 0 < int(raw) <= 2**63 - 1)
 
 
 async def publish_due(session: Session, draft: Draft, settings: Settings,
@@ -55,10 +80,17 @@ async def publish_due(session: Session, draft: Draft, settings: Settings,
         if not acknowledged_absence:
             raise PublishBlocked("Previous attempt requires manual reconciliation")
     if last and last.state == "failed" and last.attempt_number >= settings.publish_retry_limit:
+        now = dump_datetime(utc_now())
+        draft.draft_state, draft.updated_at = "cancelled", now
+        audit(session, "publication_retry_limit_reached", "draft", draft.id,
+              details={"attempt_id": last.id, "attempt_number": last.attempt_number,
+                       "retry_limit": settings.publish_retry_limit})
+        session.commit()
         raise PublishBlocked("Definite publication retry limit reached")
     if last and last.state == "failed" and last.completed_at:
         retry_after = datetime.fromisoformat(last.completed_at) + timedelta(
-            seconds=settings.retry_base_seconds * (2 ** max(0, last.attempt_number - 1)))
+            seconds=max(settings.retry_base_seconds * (2 ** max(0, last.attempt_number - 1)),
+                        last.retry_after_seconds or 0))
         if now < retry_after:
             raise PublishBlocked("Definite failure retry backoff is still active")
     claim = session.execute(update(Draft).where(
@@ -77,9 +109,12 @@ async def publish_due(session: Session, draft: Draft, settings: Settings,
     content = draft.edited_text or draft.generated_text
     try:
         message_id = await send(content)
+        if not _valid_message_id(message_id):
+            raise ValueError("Telegram response did not include a valid message ID")
     except DefinitePublishError as exc:
         attempt.state, attempt.completed_at = "failed", dump_datetime(utc_now())
         attempt.error_code, attempt.error_summary = type(exc).__name__, type(exc).__name__
+        attempt.retry_after_seconds = exc.retry_after_seconds
         draft.draft_state = "scheduled"
         session.commit()
         audit(session, "publication_failed_definite", "draft", draft.id,
@@ -113,8 +148,9 @@ def reconcile_unknown(session: Session, attempt: PublicationAttempt, actor_id: i
         raise ValueError("Only unknown attempts can be reconciled")
     now = dump_datetime(utc_now())
     if exists_in_channel:
-        if not message_id:
+        if not _valid_message_id(message_id):
             raise ValueError("Telegram message ID is required to confirm delivery")
+        message_id = str(message_id)
         attempt.state, attempt.telegram_message_id, attempt.completed_at = "succeeded", message_id, now
         publication = Publication(draft_id=attempt.draft_id, destination_id=attempt.destination_id,
                                   telegram_message_id=message_id, published_at=now)

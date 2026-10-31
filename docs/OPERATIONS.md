@@ -67,7 +67,7 @@ Logs use standard Python logging. External exception messages and credentials sh
 
 ## Telegram delivery failure handling
 
-A publication attempt is committed before calling Telegram. Confirmed success persists the message ID and timestamp. Definite Telegram rejections become `failed` and may retry within the bounded attempt limit and exponential backoff. Transport errors and other ambiguous outcomes become `unknown`, trigger an administrator notification, and are never automatically retried.
+A publication attempt is committed before calling Telegram. Confirmed success persists a validated numeric Telegram message ID and timestamp. Definite Telegram rejections become `failed` and may retry within the bounded attempt limit and exponential backoff. Telegram `RetryAfter` delays are persisted and must elapse before retry. Transport errors, malformed success responses, and other ambiguous outcomes become `unknown`, trigger an administrator notification, and are never automatically retried.
 
 For unknown attempts:
 

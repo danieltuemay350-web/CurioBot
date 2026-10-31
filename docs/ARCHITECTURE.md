@@ -77,7 +77,7 @@ Tables use integer primary keys. Persisted timestamps use ISO-8601 UTC strings w
 ### `publication_attempts`
 
 - `id` primary key; required `draft_id` FK to `drafts(id)` with `ON DELETE RESTRICT`, `destination_id` (configured target channel identifier), `attempt_number`, `state`, `started_at`, and `created_at`.
-- `state` is `sending`, `succeeded`, `failed`, or `unknown`; nullable `completed_at`, `telegram_message_id`, and sanitized `error_code`/`error_summary`. A succeeded attempt requires a message ID and completion time. Never store credentials or full sensitive response bodies. Index `(state, started_at)` and `(draft_id, destination_id)`.
+- `state` is `sending`, `succeeded`, `failed`, or `unknown`; nullable `completed_at`, `telegram_message_id`, `retry_after_seconds`, and sanitized `error_code`/`error_summary`. A succeeded attempt requires a message ID and completion time. A Telegram `RetryAfter` delay is persisted and honored alongside exponential backoff. Never store credentials or full sensitive response bodies. Index `(state, started_at)` and `(draft_id, destination_id)`.
 - Unique `(draft_id, destination_id, attempt_number)`. A send must have a persisted attempt before Telegram I/O. A `sending` attempt found after process death is conservatively reconciled as `unknown`, not retried automatically.
 
 ### `publications`

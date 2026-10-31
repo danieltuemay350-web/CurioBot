@@ -289,9 +289,11 @@ async def draft_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if action == "approve":
                 approve_draft(session, draft, query.from_user.id)
                 result = "approved"
-            else:
+            elif action == "reject":
                 reject_draft(session, draft, query.from_user.id, "Rejected by administrator")
                 result = "rejected"
+            else:
+                raise WorkflowError("Unsupported draft action")
             session.commit()
         await query.answer(f"Draft {result}")
         await query.edit_message_text(f"Draft #{raw_id} {result}.")

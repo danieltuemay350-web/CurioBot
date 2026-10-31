@@ -17,7 +17,7 @@ from app.config import Settings
 from app.database.models import AppSetting, Article, ArticleText, Draft, Publication, PublicationAttempt, Source
 from app.ingestion import add_source_candidate, extract_article, poll_rss
 from app.publisher import (AmbiguousPublishError, DefinitePublishError, PublishBlocked,
-                           publish_due, recover_stale_attempts)
+                           normalize_retry_after, publish_due, recover_stale_attempts)
 from app.retention import cleanup_expired_text
 from app.timeutil import dump_datetime, utc_now
 from app.workflow import (article_retry_count, audit, record_article_failure,
@@ -180,7 +180,11 @@ async def publish_jobs(application, settings: Settings, sessions) -> None:
                         message = await application.bot.send_message(
                             chat_id=settings.telegram_target_chat_id, text=text,
                             disable_web_page_preview=True)
-                    except (RetryAfter, BadRequest, Forbidden) as exc:
+                    except RetryAfter as exc:
+                        delay = normalize_retry_after(exc.retry_after)
+                        raise DefinitePublishError(
+                            "Telegram rate limited the send", retry_after_seconds=delay) from exc
+                    except (BadRequest, Forbidden) as exc:
                         raise DefinitePublishError(str(exc)) from exc
                     return str(message.message_id)
 
@@ -199,6 +203,9 @@ async def publish_jobs(application, settings: Settings, sessions) -> None:
                     f"Delivery for draft #{draft_id} is UNKNOWN (attempt #{attempt.id if attempt else 'n/a'}). "
                     "Inspect the channel and use /reconcile; do not retry automatically.")
             except PublishBlocked:
+                if draft.draft_state == "cancelled":
+                    await notify_admins(application, settings,
+                        f"Draft #{draft_id} was cancelled after reaching the definite Telegram retry limit. Review /queue and audit history.")
                 continue
             except TelegramError as exc:
                 # Unclassified Telegram transport errors may occur after acceptance.
@@ -213,6 +220,23 @@ async def publish_jobs(application, settings: Settings, sessions) -> None:
                                     f"Telegram result for draft #{draft_id} requires manual review.")
             except Exception:
                 logger.error("Unexpected publisher error", extra={"error_type": "publish_error"})
+                try:
+                    session.rollback()
+                    attempt = session.scalar(select(PublicationAttempt).where(
+                        PublicationAttempt.draft_id == draft_id,
+                        PublicationAttempt.destination_id == settings.telegram_target_chat_id,
+                        PublicationAttempt.state == "sending").order_by(
+                            PublicationAttempt.attempt_number.desc()))
+                    if attempt:
+                        attempt.state = "unknown"
+                        attempt.completed_at = dump_datetime(utc_now())
+                        attempt.error_code = "unexpected_publish_error"
+                        attempt.error_summary = "Delivery outcome requires manual reconciliation"
+                        session.commit()
+                except Exception:
+                    logger.error("Could not persist unknown Telegram outcome", extra={"error_type": "publish_recovery_error"})
+                await notify_admins(application, settings,
+                                    f"Publishing draft #{draft_id} failed unexpectedly; inspect /queue and reconcile any UNKNOWN attempt.")
 
 
 def _mark_definite(session, draft_id: int, error: Exception) -> None:

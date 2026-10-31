@@ -24,7 +24,8 @@ def test_alembic_upgrade_creates_schema_and_foreign_keys(tmp_path, monkeypatch):
     assert {fk["referred_table"] for fk in inspector.get_foreign_keys("article_text")} == {"articles"}
     with engine.connect() as connection:
         assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
-        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0001_initial"
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0002_attempt_retry_after"
+        assert "retry_after_seconds" in {column["name"] for column in inspector.get_columns("publication_attempts")}
     engine.dispose()
 
 
@@ -49,7 +50,7 @@ def test_alembic_and_application_share_dotenv_database_url(tmp_path, monkeypatch
     try:
         assert inspect(engine).has_table("alembic_version")
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0001_initial"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0002_attempt_retry_after"
     finally:
         engine.dispose()
     assert not accidental_default.exists()

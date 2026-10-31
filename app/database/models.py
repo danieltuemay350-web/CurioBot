@@ -1,6 +1,6 @@
 """SQLAlchemy persistence models."""
 
-from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -121,6 +121,7 @@ class PublicationAttempt(Base):
     telegram_message_id: Mapped[str | None] = mapped_column(String(100))
     error_code: Mapped[str | None] = mapped_column(String(100))
     error_summary: Mapped[str | None] = mapped_column(String(500))
+    retry_after_seconds: Mapped[float | None] = mapped_column(Float)
 
     draft: Mapped[Draft] = relationship(back_populates="attempts")
 

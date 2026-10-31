@@ -6,6 +6,7 @@ import http.client
 import ipaddress
 import socket
 import ssl
+import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -36,6 +37,21 @@ class FetchedResponse:
     status: int
     content_type: str
     body: bytes
+
+
+def _public_address(value: str) -> str:
+    """Return a normalized globally routable address or fail closed."""
+    try:
+        address = ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError as exc:
+        raise UnsafeURLError("DNS returned an invalid address") from exc
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    if (not address.is_global or address.is_loopback or address.is_private
+            or address.is_link_local or address.is_multicast or address.is_unspecified
+            or address.is_reserved):
+        raise UnsafeURLError("Host resolves to a non-public IP address")
+    return str(address)
 
 
 def normalize_url(url: str) -> str:
@@ -69,13 +85,7 @@ def resolve_public_addresses(host: str, port: int, resolver=socket.getaddrinfo,
         raise UnsafeURLError("Hostname could not be resolved") from exc
     addresses: set[str] = set()
     for record in records:
-        try:
-            address = ipaddress.ip_address(record[4][0].split("%", 1)[0])
-        except ValueError as exc:
-            raise UnsafeURLError("DNS returned an invalid address") from exc
-        if not address.is_global:
-            raise UnsafeURLError("Host resolves to a non-public IP address")
-        addresses.add(str(address))
+        addresses.add(_public_address(record[4][0]))
     if not addresses:
         raise UnsafeURLError("Hostname returned no addresses")
     return tuple(sorted(addresses))
@@ -108,12 +118,31 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
 
 
+def _read_bounded_body(raw, sock, max_bytes: int, timeout: float) -> bytes:
+    """Bound body bytes and total read time, including slow-drip responses."""
+    deadline = time.monotonic() + timeout
+    body = bytearray()
+    while len(body) <= max_bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FetchError("Response read deadline exceeded")
+        sock.settimeout(remaining)
+        chunk = raw.read1(min(64 * 1024, max_bytes + 1 - len(body)))
+        if not chunk:
+            break
+        body.extend(chunk)
+    if len(body) > max_bytes:
+        raise FetchError("Response exceeds the configured size limit")
+    return bytes(body)
+
+
 def safe_fetch(
     url: str, limits: FetchLimits, *, resolver=socket.getaddrinfo
 ) -> FetchedResponse:
     current = normalize_url(url)
     accepted = {"text/html", "application/xhtml+xml", "application/rss+xml", "application/feed+xml", "application/xml", "text/xml", "application/atom+xml"}
     for redirect_count in range(limits.max_redirects + 1):
+        connect_deadline = time.monotonic() + limits.connect_timeout
         parts = urlsplit(current)
         port = parts.port or (443 if parts.scheme == "https" else 80)
         if port not in limits.allowed_ports:
@@ -122,17 +151,21 @@ def safe_fetch(
         try:
             literal = ipaddress.ip_address(host)
         except ValueError:
-            addresses = resolve_public_addresses(host, port, resolver, limits.connect_timeout)
+            remaining = connect_deadline - time.monotonic()
+            if remaining <= 0:
+                raise FetchError("Connection deadline exceeded")
+            addresses = resolve_public_addresses(host, port, resolver, remaining)
         else:
-            if not literal.is_global:
-                raise UnsafeURLError("Host is a non-public IP address")
-            addresses = (str(literal),)
+            addresses = (_public_address(str(literal)),)
         # Pin the actual TCP connection to a validated address; do not let a second DNS
         # lookup change the destination between policy validation and connect.
         last_error: Exception | None = None
         response: FetchedResponse | None = None
         for address in addresses:
-            conn = _connection(current, address, limits.connect_timeout)
+            remaining = connect_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            conn = _connection(current, address, remaining)
             try:
                 request_path = urlunsplit(("", "", parts.path or "/", parts.query, ""))
                 conn.request("GET", request_path, headers={
@@ -143,7 +176,8 @@ def safe_fetch(
                     "Connection": "close",
                 })
                 assert conn.sock is not None
-                conn.sock.settimeout(limits.read_timeout)
+                response_sock = conn.sock
+                response_sock.settimeout(limits.read_timeout)
                 raw = conn.getresponse()
                 status = raw.status
                 if status in {301, 302, 303, 307, 308}:
@@ -165,9 +199,8 @@ def safe_fetch(
                     raise FetchError(f"Remote server returned HTTP {status}")
                 if content_type not in accepted:
                     raise FetchError("Unsupported response content type")
-                body = raw.read(limits.max_bytes + 1)
-                if len(body) > limits.max_bytes:
-                    raise FetchError("Response exceeds the configured size limit")
+                body = _read_bounded_body(raw, response_sock, limits.max_bytes,
+                                          limits.read_timeout)
                 response = FetchedResponse(current, status, content_type, body)
                 raw.close()
                 conn.close()
@@ -178,6 +211,10 @@ def safe_fetch(
             except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
                 conn.close()
                 last_error = exc
+            except Exception:
+                # Malformed headers and other parser errors must not leak sockets.
+                conn.close()
+                raise
         if response is None:
             raise FetchError("Could not connect to validated public destination") from last_error
         if response.status not in {301, 302, 303, 307, 308}:
