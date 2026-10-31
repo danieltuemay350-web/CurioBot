@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools==75.8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-reading-bot"
+version = "0.1.0"
+description = "Approval-based Telegram knowledge-sharing bot"
+requires-python = ">=3.12"
+dependencies = [
+  "python-telegram-bot==21.10",
+  "SQLAlchemy==2.0.38",
+  "alembic==1.15.1",
+  "feedparser==6.0.11",
+  "trafilatura==2.0.0",
+  "google-genai==1.11.0",
+  "APScheduler==3.11.0",
+  "pydantic==2.11.1",
+  "pydantic-settings==2.8.1",
+  "httpx==0.28.1",
+  "tzdata==2025.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.5", "ruff==0.11.2", "mypy==1.15.0"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
